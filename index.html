@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b1220">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Fantasy Live">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<title>Fantasy Live</title>
+<style>
+  :root { --bg:#0b1220; --card:#141d31; --line:#22304d; --text:#e8edf7; --muted:#8b98b5; --accent:#3ddc97; --live:#ff5a5f; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         padding:env(safe-area-inset-top) 0 calc(64px + env(safe-area-inset-bottom)); }
+  header { position:sticky; top:0; z-index:5; background:var(--bg); padding:14px 16px 10px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); }
+  header h1 { font-size:20px; margin:0; }
+  #updated { color:var(--muted); font-size:12px; }
+  main { padding:12px 12px 24px; max-width:640px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:12px 14px; margin-bottom:10px; }
+  .game { display:flex; justify-content:space-between; align-items:center; cursor:pointer; }
+  .teams div { display:flex; justify-content:space-between; gap:24px; font-weight:600; }
+  .teams { flex:1; }
+  .status { width:90px; text-align:right; font-size:13px; color:var(--muted); }
+  .status.in { color:var(--live); font-weight:600; }
+  .box { margin-top:10px; border-top:1px solid var(--line); padding-top:6px; }
+  .row { display:flex; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--line); gap:8px; }
+  .row:last-child { border-bottom:0; }
+  .name { font-weight:600; }
+  .sub { color:var(--muted); font-size:12px; }
+  .pts { font-weight:700; font-variant-numeric:tabular-nums; min-width:48px; text-align:right; }
+  .total { font-size:34px; font-weight:800; color:var(--accent); }
+  button { font:inherit; border:0; border-radius:10px; padding:8px 12px; background:var(--line); color:var(--text); cursor:pointer; }
+  button.add { background:var(--accent); color:#06281a; font-weight:700; padding:4px 10px; }
+  button.remove { background:transparent; color:var(--muted); padding:4px 8px; }
+  select, input { font:inherit; width:100%; padding:10px; border-radius:10px; border:1px solid var(--line); background:var(--bg); color:var(--text); margin-top:6px; }
+  label { display:block; margin-bottom:14px; color:var(--muted); font-size:13px; }
+  nav { position:fixed; bottom:0; left:0; right:0; display:flex; background:#0e1628; border-top:1px solid var(--line); padding-bottom:env(safe-area-inset-bottom); }
+  nav button { flex:1; background:transparent; border-radius:0; padding:14px 0; color:var(--muted); font-weight:600; }
+  nav button.active { color:var(--accent); }
+  .empty { color:var(--muted); text-align:center; padding:30px 10px; }
+  .err { color:var(--live); }
+</style>
+</head>
+<body>
+<header><h1 id="title">Games</h1><span id="updated"></span></header>
+<main id="view"></main>
+<nav>
+  <button data-tab="games" class="active">Games</button>
+  <button data-tab="team">My Team</button>
+  <button data-tab="settings">Settings</button>
+</nav>
+
+<script>
+// ---------- Config ----------
+const ESPN = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
+const POLL_MS = 60000;
+const SCORING = {
+  ppr:      { rec: 1 },
+  half:     { rec: 0.5 },
+  standard: { rec: 0 },
+};
+const BASE = { passYds: 0.04, passTD: 4, int: -2, rushYds: 0.1, rushTD: 6, recYds: 0.1, recTD: 6, fumLost: -2, fg: 3, xp: 1 };
+
+// ---------- State ----------
+const store = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+let settings = store.get("settings", { scoring: "ppr", week: "", api: "" });
+let roster = store.get("roster", []);
+let tab = "games";
+let scoreboard = null;
+let openGame = null;
+const boxCache = {}; // eventId -> { players, final }
+
+const api = () => (settings.api || ESPN).replace(/\/$/, "");
+
+// ---------- Data ----------
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+async function loadScoreboard() {
+  const q = settings.week ? `?seasontype=2&week=${settings.week}` : "";
+  const data = await getJSON(`${api()}/scoreboard${q}`);
+  scoreboard = {
+    week: data.week?.number,
+    games: (data.events || []).map(e => {
+      const c = e.competitions?.[0] || {};
+      const side = ha => c.competitors?.find(t => t.homeAway === ha) || {};
+      const h = side("home"), a = side("away");
+      return {
+        id: e.id,
+        state: e.status?.type?.state,            // pre | in | post
+        detail: e.status?.type?.shortDetail || "",
+        home: { abbr: h.team?.abbreviation, score: h.score ?? "" },
+        away: { abbr: a.team?.abbreviation, score: a.score ?? "" },
+      };
+    }),
+  };
+}
+
+const num = v => { const n = parseFloat(v); return isNaN(n) ? 0 : n; };
+const made = v => num(String(v ?? "").split("/")[0]);
+
+// Turn an ESPN game summary into { athleteId: { name, team, stats } }
+function parseBox(summary) {
+  const players = {};
+  for (const teamBlock of summary.boxscore?.players || []) {
+    const team = teamBlock.team?.abbreviation;
+    for (const cat of teamBlock.statistics || []) {
+      const keys = cat.keys || [];
+      for (const a of cat.athletes || []) {
+        const id = a.athlete?.id; if (!id) continue;
+        const p = players[id] ||= { id, name: a.athlete.displayName, team, stats: {} };
+        const s = p.stats;
+        const get = k => a.stats?.[keys.indexOf(k)];
+        switch (cat.name) {
+          case "passing":   s.passYds = num(get("passingYards")); s.passTD = num(get("passingTouchdowns")); s.int = num(get("interceptions")); p.pos ||= "QB"; break;
+          case "rushing":   s.rushYds = num(get("rushingYards")); s.rushTD = num(get("rushingTouchdowns")); break;
+          case "receiving": s.rec = num(get("receptions")); s.recYds = num(get("receivingYards")); s.recTD = num(get("receivingTouchdowns")); break;
+          case "fumbles":   s.fumLost = num(get("fumblesLost")); break;
+          case "kicking":   s.fg = made(get("fieldGoalsMade/fieldGoalAttempts")); s.xp = made(get("extraPointsMade/extraPointAttempts")); p.pos = "K"; break;
+        }
+      }
+    }
+  }
+  return players;
+}
+
+function points(stats) {
+  const w = { ...BASE, ...SCORING[settings.scoring] };
+  let total = 0;
+  for (const k in stats) total += (stats[k] || 0) * (w[k] || 0);
+  return Math.round(total * 100) / 100;
+}
+
+function statLine(s) {
+  const parts = [];
+  if (s.passYds || s.passTD) parts.push(`${s.passYds} pass yd, ${s.passTD} TD${s.int ? `, ${s.int} INT` : ""}`);
+  if (s.rushYds || s.rushTD) parts.push(`${s.rushYds} rush yd${s.rushTD ? `, ${s.rushTD} TD` : ""}`);
+  if (s.rec || s.recYds) parts.push(`${s.rec} rec, ${s.recYds} yd${s.recTD ? `, ${s.recTD} TD` : ""}`);
+  if (s.fg || s.xp) parts.push(`${s.fg} FG, ${s.xp} XP`);
+  if (s.fumLost) parts.push(`${s.fumLost} fum lost`);
+  return parts.join(" · ") || "No stats yet";
+}
+
+const inflight = {};
+async function loadBox(game) {
+  const cached = boxCache[game.id];
+  if (cached && (cached.final || Date.now() - cached.at < 20000)) return cached.players;
+  if (game.state === "pre") return {};
+  // Several roster players can share a game, so share one request
+  inflight[game.id] ||= getJSON(`${api()}/summary?event=${game.id}`)
+    .then(data => {
+      const players = parseBox(data);
+      boxCache[game.id] = { players, final: game.state === "post", at: Date.now() };
+      return players;
+    })
+    .finally(() => delete inflight[game.id]);
+  return inflight[game.id];
+}
+
+// ---------- Rendering ----------
+const $view = document.getElementById("view");
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const onRoster = id => roster.some(p => p.id === id);
+
+function gameCard(g) {
+  return `<div class="card" data-game="${g.id}">
+    <div class="game">
+      <div class="teams">
+        <div><span>${esc(g.away.abbr)}</span><span>${esc(g.away.score)}</span></div>
+        <div><span>${esc(g.home.abbr)}</span><span>${esc(g.home.score)}</span></div>
+      </div>
+      <div class="status ${g.state === "in" ? "in" : ""}">${esc(g.detail)}</div>
+    </div>
+    <div class="box" id="box-${g.id}" ${openGame === g.id ? "" : "hidden"}></div>
+  </div>`;
+}
+
+async function renderGames() {
+  if (!scoreboard?.games.length) { $view.innerHTML = `<div class="empty">No games found for this week.</div>`; return; }
+  const order = { in: 0, pre: 1, post: 2 };
+  const games = [...scoreboard.games].sort((a, b) => order[a.state] - order[b.state]);
+  $view.innerHTML = games.map(gameCard).join("");
+  if (openGame) await renderBox(scoreboard.games.find(g => g.id === openGame));
+}
+
+async function renderBox(g) {
+  const el = document.getElementById(`box-${g?.id}`); if (!el) return;
+  el.hidden = false;
+  if (g.state === "pre") { el.innerHTML = `<div class="sub">Game hasn't started.</div>`; return; }
+  el.innerHTML = `<div class="sub">Loading…</div>`;
+  try {
+    const players = Object.values(await loadBox(g))
+      .map(p => ({ ...p, pts: points(p.stats) }))
+      .filter(p => statLine(p.stats) !== "No stats yet")
+      .sort((a, b) => b.pts - a.pts);
+    el.innerHTML = players.map(p => `<div class="row">
+        <div><div class="name">${esc(p.name)}</div><div class="sub">${esc(p.team)} · ${esc(statLine(p.stats))}</div></div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="pts">${p.pts.toFixed(1)}</span>
+          ${onRoster(p.id) ? `<span class="sub">✓</span>` : `<button class="add" data-add='${esc(JSON.stringify({ id: p.id, name: p.name, team: p.team }))}'>+</button>`}
+        </div>
+      </div>`).join("") || `<div class="sub">No fantasy stats yet.</div>`;
+  } catch (e) { el.innerHTML = `<div class="err">Couldn't load box score (${esc(e.message)}).</div>`; }
+}
+
+async function renderTeam() {
+  if (!roster.length) { $view.innerHTML = `<div class="empty">No players yet.<br>Open a game on the Games tab and tap + next to a player.</div>`; return; }
+  const rows = await Promise.all(roster.map(async p => {
+    const g = scoreboard?.games.find(g => g.home.abbr === p.team || g.away.abbr === p.team);
+    if (!g) return { ...p, pts: 0, line: "Bye or no game this week", status: "" };
+    try {
+      const box = await loadBox(g);
+      const s = box[p.id]?.stats || {};
+      return { ...p, pts: points(s), line: g.state === "pre" ? "Not started" : statLine(s), status: g.detail, live: g.state === "in" };
+    } catch { return { ...p, pts: 0, line: "Couldn't load stats", status: g.detail }; }
+  }));
+  const total = rows.reduce((t, r) => t + r.pts, 0);
+  $view.innerHTML = `<div class="card"><div class="sub">Week ${esc(scoreboard?.week ?? "")} total · ${settings.scoring.toUpperCase()}</div><div class="total">${total.toFixed(2)}</div></div>
+    <div class="card">${rows.map(r => `<div class="row">
+      <div><div class="name">${esc(r.name)} <span class="sub">${esc(r.team)}</span></div>
+           <div class="sub">${esc(r.line)}${r.status ? ` · <span style="${r.live ? "color:var(--live)" : ""}">${esc(r.status)}</span>` : ""}</div></div>
+      <div style="display:flex;align-items:center;gap:4px"><span class="pts">${r.pts.toFixed(1)}</span><button class="remove" data-remove="${esc(r.id)}">✕</button></div>
+    </div>`).join("")}</div>`;
+}
+
+function renderSettings() {
+  const weeks = Array.from({ length: 18 }, (_, i) => i + 1);
+  $view.innerHTML = `<div class="card">
+    <label>Scoring<select id="s-scoring">
+      ${["ppr","half","standard"].map(s => `<option value="${s}" ${settings.scoring === s ? "selected" : ""}>${{ ppr:"PPR", half:"Half PPR", standard:"Standard" }[s]}</option>`).join("")}
+    </select></label>
+    <label>Week<select id="s-week">
+      <option value="">Current week</option>
+      ${weeks.map(w => `<option value="${w}" ${String(settings.week) === String(w) ? "selected" : ""}>Week ${w}</option>`).join("")}
+    </select></label>
+    <label>Proxy URL (optional, your Cloudflare Worker)<input id="s-api" placeholder="https://your-worker.workers.dev" value="${esc(settings.api)}"></label>
+    <button id="s-save" class="add" style="padding:10px 16px">Save</button>
+    <button id="s-clear" style="margin-left:8px">Clear roster</button>
+  </div>`;
+}
+
+async function render() {
+  document.getElementById("title").textContent = { games: "Games", team: "My Team", settings: "Settings" }[tab];
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  if (tab === "settings") return renderSettings();
+  if (tab === "games") return renderGames();
+  if (tab === "team") return renderTeam();
+}
+
+async function refresh() {
+  try {
+    await loadScoreboard();
+    document.getElementById("updated").textContent = `Wk ${scoreboard.week ?? "?"} · ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+  } catch (e) {
+    document.getElementById("updated").innerHTML = `<span class="err">Offline</span>`;
+    if (!scoreboard) { $view.innerHTML = `<div class="empty err">Couldn't reach the data source (${esc(e.message)}).<br>Try again, or set a proxy URL in Settings.</div>`; return; }
+  }
+  if (tab !== "settings") render();
+}
+
+// ---------- Events ----------
+document.querySelector("nav").addEventListener("click", e => {
+  const b = e.target.closest("button[data-tab]"); if (!b) return;
+  tab = b.dataset.tab; render();
+});
+
+$view.addEventListener("click", async e => {
+  const add = e.target.closest("[data-add]");
+  if (add) { roster.push(JSON.parse(add.dataset.add)); store.set("roster", roster); add.outerHTML = `<span class="sub">✓</span>`; return; }
+  const rm = e.target.closest("[data-remove]");
+  if (rm) { roster = roster.filter(p => p.id !== rm.dataset.remove); store.set("roster", roster); renderTeam(); return; }
+  if (e.target.id === "s-save") {
+    const oldWeek = settings.week;
+    settings = { scoring: document.getElementById("s-scoring").value, week: document.getElementById("s-week").value, api: document.getElementById("s-api").value.trim() };
+    store.set("settings", settings);
+    if (oldWeek !== settings.week) for (const k in boxCache) delete boxCache[k];
+    tab = "games"; refresh(); return;
+  }
+  if (e.target.id === "s-clear") { if (confirmClear()) { roster = []; store.set("roster", roster); } return; }
+  const card = e.target.closest("[data-game]");
+  if (card && tab === "games") {
+    const id = card.dataset.game;
+    if (openGame === id) { openGame = null; document.getElementById(`box-${id}`).hidden = true; return; }
+    if (openGame) { const prev = document.getElementById(`box-${openGame}`); if (prev) prev.hidden = true; }
+    openGame = id; renderBox(scoreboard.games.find(g => g.id === id));
+  }
+});
+
+// Two-tap clear instead of a browser dialog
+let clearArmed = false;
+function confirmClear() {
+  const b = document.getElementById("s-clear");
+  if (clearArmed) { clearArmed = false; b.textContent = "Cleared"; return true; }
+  clearArmed = true; b.textContent = "Tap again to clear";
+  setTimeout(() => { clearArmed = false; if (b.isConnected) b.textContent = "Clear roster"; }, 3000);
+  return false;
+}
+
+// Poll every minute while the app is open; refresh when you come back to it
+setInterval(() => { if (document.visibilityState === "visible") refresh(); }, POLL_MS);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh(); });
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+refresh();
+</script>
+</body>
+</html>
